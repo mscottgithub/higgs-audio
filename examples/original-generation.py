@@ -1,10 +1,4 @@
-"""Example script for generating audio using HiggsAudio.
-
-Patched for LOCAL-ONLY loading:
-- Defaults point to your on-disk model/tokenizer/Hubert paths
-- Enforces local_files_only=True for all from_pretrained() calls
-- Sets offline/cache env defaults to your big-disk location
-"""
+"""Example script for generating audio using HiggsAudio."""
 
 import click
 import soundfile as sf
@@ -35,15 +29,6 @@ from transformers.cache_utils import StaticCache
 from typing import Optional
 from dataclasses import asdict
 import torch
-
-# ---------- HARDEN OFFLINE / LOCAL-ONLY DEFAULTS ----------
-# (These can still be overridden by environment when needed.)
-os.environ.setdefault("HF_HOME", "/mnt/data3/VoiceModels/huggingface")
-os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/mnt/data3/VoiceModels/huggingface")
-os.environ.setdefault("TRANSFORMERS_CACHE", "/mnt/data3/VoiceModels/huggingface")
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-# ----------------------------------------------------------
 
 CURR_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -225,31 +210,17 @@ class HiggsAudioModelClient:
         else:
             self._audio_tokenizer = audio_tokenizer
 
-        # ---- LOCAL-ONLY MODEL/CONFIG/TOKENIZER LOADS ----
         self._model = HiggsAudioModel.from_pretrained(
             model_path,
             device_map=self._device,
             torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            local_files_only=True,
         )
         self._model.eval()
         self._kv_cache_lengths = kv_cache_lengths
         self._use_static_kv_cache = use_static_kv_cache
 
-        self._tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
-            use_fast=True,
-            trust_remote_code=True,
-            local_files_only=True,
-        )
-        self._config = AutoConfig.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            local_files_only=True,
-        )
-        # --------------------------------------------------
-
+        self._tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self._config = AutoConfig.from_pretrained(model_path)
         self._max_new_tokens = max_new_tokens
         self._collator = HiggsAudioSampleCollator(
             whisper_processor=None,
@@ -462,4 +433,336 @@ def prepare_generation_context(scene_prompt, ref_audio, ref_audio_in_system_mess
         for spk_id, character_name in enumerate(ref_audio.split(",")):
             if not character_name.startswith("profile:"):
                 prompt_audio_path = os.path.join(f"{CURR_DIR}/voice_prompts", f"{character_name}.wav")
-                prompt_text_path = os.path.j
+                prompt_text_path = os.path.join(f"{CURR_DIR}/voice_prompts", f"{character_name}.txt")
+                assert os.path.exists(prompt_audio_path), (
+                    f"Voice prompt audio file {prompt_audio_path} does not exist."
+                )
+                assert os.path.exists(prompt_text_path), f"Voice prompt text file {prompt_text_path} does not exist."
+                with open(prompt_text_path, "r", encoding="utf-8") as f:
+                    prompt_text = f.read().strip()
+                audio_tokens = audio_tokenizer.encode(prompt_audio_path)
+                audio_ids.append(audio_tokens)
+
+                if not ref_audio_in_system_message:
+                    messages.append(
+                        Message(
+                            role="user",
+                            content=f"[SPEAKER{spk_id}] {prompt_text}" if num_speakers > 1 else prompt_text,
+                        )
+                    )
+                    messages.append(
+                        Message(
+                            role="assistant",
+                            content=AudioContent(
+                                audio_url=prompt_audio_path,
+                            ),
+                        )
+                    )
+    else:
+        if len(speaker_tags) > 1:
+            # By default, we just alternate between male and female voices
+            speaker_desc_l = []
+
+            for idx, tag in enumerate(speaker_tags):
+                if idx % 2 == 0:
+                    speaker_desc = f"feminine"
+                else:
+                    speaker_desc = f"masculine"
+                speaker_desc_l.append(f"{tag}: {speaker_desc}")
+
+            speaker_desc = "\n".join(speaker_desc_l)
+            scene_desc_l = []
+            if scene_prompt:
+                scene_desc_l.append(scene_prompt)
+            scene_desc_l.append(speaker_desc)
+            scene_desc = "\n\n".join(scene_desc_l)
+
+            system_message = Message(
+                role="system",
+                content=f"{MULTISPEAKER_DEFAULT_SYSTEM_MESSAGE}\n\n<|scene_desc_start|>\n{scene_desc}\n<|scene_desc_end|>",
+            )
+        else:
+            system_message_l = ["Generate audio following instruction."]
+            if scene_prompt:
+                system_message_l.append(f"<|scene_desc_start|>\n{scene_prompt}\n<|scene_desc_end|>")
+            system_message = Message(
+                role="system",
+                content="\n\n".join(system_message_l),
+            )
+    if system_message:
+        messages.insert(0, system_message)
+    return messages, audio_ids
+
+
+@click.command()
+@click.option(
+    "--model_path",
+    type=str,
+    default="bosonai/higgs-audio-v2-generation-3B-base",
+    help="Output wav file path.",
+)
+@click.option(
+    "--audio_tokenizer",
+    type=str,
+    default="bosonai/higgs-audio-v2-tokenizer",
+    help="Audio tokenizer path, if not set, use the default one.",
+)
+@click.option(
+    "--max_new_tokens",
+    type=int,
+    default=2048,
+    help="The maximum number of new tokens to generate.",
+)
+@click.option(
+    "--transcript",
+    type=str,
+    default="transcript/single_speaker/en_dl.txt",
+    help="The prompt to use for generation. If not set, we will use a default prompt.",
+)
+@click.option(
+    "--scene_prompt",
+    type=str,
+    default=f"{CURR_DIR}/scene_prompts/quiet_indoor.txt",
+    help="The scene description prompt to use for generation. If not set, or set to `empty`, we will leave it to empty.",
+)
+@click.option(
+    "--temperature",
+    type=float,
+    default=1.0,
+    help="The value used to module the next token probabilities.",
+)
+@click.option(
+    "--top_k",
+    type=int,
+    default=50,
+    help="The number of highest probability vocabulary tokens to keep for top-k-filtering.",
+)
+@click.option(
+    "--top_p",
+    type=float,
+    default=0.95,
+    help="If set to float < 1, only the most probable tokens with probabilities that add up to top_p or higher are kept for generation.",
+)
+@click.option(
+    "--ras_win_len",
+    type=int,
+    default=7,
+    help="The window length for RAS sampling. If set to 0 or a negative value, we won't use RAS sampling.",
+)
+@click.option(
+    "--ras_win_max_num_repeat",
+    type=int,
+    default=2,
+    help="The maximum number of times to repeat the RAS window. Only used when --ras_win_len is set.",
+)
+@click.option(
+    "--ref_audio",
+    type=str,
+    default=None,
+    help="The voice prompt to use for generation. If not set, we will let the model randomly pick a voice. "
+    "For multi-speaker generation, you can specify the prompts as `belinda,chadwick` and we will use the voice of belinda as SPEAKER0 and the voice of chadwick as SPEAKER1.",
+)
+@click.option(
+    "--ref_audio_in_system_message",
+    is_flag=True,
+    default=False,
+    help="Whether to include the voice prompt description in the system message.",
+    show_default=True,
+)
+@click.option(
+    "--chunk_method",
+    default=None,
+    type=click.Choice([None, "speaker", "word"]),
+    help="The method to use for chunking the prompt text. Options are 'speaker', 'word', or None. By default, we won't use any chunking and will feed the whole text to the model.",
+)
+@click.option(
+    "--chunk_max_word_num",
+    default=200,
+    type=int,
+    help="The maximum number of words for each chunk when 'word' chunking method is used. Only used when --chunk_method is set to 'word'.",
+)
+@click.option(
+    "--chunk_max_num_turns",
+    default=1,
+    type=int,
+    help="The maximum number of turns for each chunk when 'speaker' chunking method is used. Only used when --chunk_method is set to 'speaker'.",
+)
+@click.option(
+    "--generation_chunk_buffer_size",
+    default=None,
+    type=int,
+    help="The maximal number of chunks to keep in the buffer. We will always keep the reference audios, and keep `max_chunk_buffer` chunks of generated audio.",
+)
+@click.option(
+    "--seed",
+    default=None,
+    type=int,
+    help="Random seed for generation.",
+)
+@click.option(
+    "--device_id",
+    type=int,
+    default=None,
+    help="The device to run the model on.",
+)
+@click.option(
+    "--out_path",
+    type=str,
+    default="generation.wav",
+)
+@click.option(
+    "--use_static_kv_cache",
+    type=int,
+    default=1,
+    help="Whether to use static KV cache for faster generation. Only works when using GPU.",
+)
+@click.option(
+    "--device",
+    type=click.Choice(["auto", "cuda", "mps", "none"]),
+    default="auto",
+    help="Device to use: 'auto' (pick best available), 'cuda', 'mps', or 'none' (CPU only).",
+)
+def main(
+    model_path,
+    audio_tokenizer,
+    max_new_tokens,
+    transcript,
+    scene_prompt,
+    temperature,
+    top_k,
+    top_p,
+    ras_win_len,
+    ras_win_max_num_repeat,
+    ref_audio,
+    ref_audio_in_system_message,
+    chunk_method,
+    chunk_max_word_num,
+    chunk_max_num_turns,
+    generation_chunk_buffer_size,
+    seed,
+    device_id,
+    out_path,
+    use_static_kv_cache,
+    device,
+):
+    # specifying a device_id implies CUDA
+    if device_id is None:
+        if device == "auto":
+            if torch.cuda.is_available():
+                device_id = 0
+                device = "cuda:0"
+            elif torch.backends.mps.is_available():
+                device_id = None  # MPS doesn't use device IDs like CUDA
+                device = "mps"
+            else:
+                device_id = None
+                device = "cpu"
+        elif device == "cuda":
+            device_id = 0
+            device = "cuda:0"
+        elif device == "mps":
+            device_id = None
+            device = "mps"
+        else:
+            device_id = None
+            device = "cpu"
+    else:
+        device = f"cuda:{device_id}"
+    # For MPS, use CPU for audio tokenizer due to embedding operation limitations
+    audio_tokenizer_device = "cpu" if device == "mps" else device
+    audio_tokenizer = load_higgs_audio_tokenizer(audio_tokenizer, device=audio_tokenizer_device)
+
+    # Disable static KV cache on MPS since it relies on CUDA graphs
+    if device == "mps" and use_static_kv_cache:
+        use_static_kv_cache = False
+    model_client = HiggsAudioModelClient(
+        model_path=model_path,
+        audio_tokenizer=audio_tokenizer,
+        device=device,
+        device_id=device_id,
+        max_new_tokens=max_new_tokens,
+        use_static_kv_cache=use_static_kv_cache,
+    )
+
+    pattern = re.compile(r"\[(SPEAKER\d+)\]")
+
+    if os.path.exists(transcript):
+        logger.info(f"Loading transcript from {transcript}")
+        with open(transcript, "r", encoding="utf-8") as f:
+            transcript = f.read().strip()
+
+    if scene_prompt is not None and scene_prompt != "empty" and os.path.exists(scene_prompt):
+        with open(scene_prompt, "r", encoding="utf-8") as f:
+            scene_prompt = f.read().strip()
+    else:
+        scene_prompt = None
+
+    speaker_tags = sorted(set(pattern.findall(transcript)))
+    # Perform some basic normalization
+    transcript = normalize_chinese_punctuation(transcript)
+    # Other normalizations (e.g., parentheses and other symbols. Will be improved in the future)
+    transcript = transcript.replace("(", " ")
+    transcript = transcript.replace(")", " ")
+    transcript = transcript.replace("°F", " degrees Fahrenheit")
+    transcript = transcript.replace("°C", " degrees Celsius")
+
+    for tag, replacement in [
+        ("[laugh]", "<SE>[Laughter]</SE>"),
+        ("[humming start]", "<SE_s>[Humming]</SE_s>"),
+        ("[humming end]", "<SE_e>[Humming]</SE_e>"),
+        ("[music start]", "<SE_s>[Music]</SE_s>"),
+        ("[music end]", "<SE_e>[Music]</SE_e>"),
+        ("[music]", "<SE>[Music]</SE>"),
+        ("[sing start]", "<SE_s>[Singing]</SE_s>"),
+        ("[sing end]", "<SE_e>[Singing]</SE_e>"),
+        ("[applause]", "<SE>[Applause]</SE>"),
+        ("[cheering]", "<SE>[Cheering]</SE>"),
+        ("[cough]", "<SE>[Cough]</SE>"),
+    ]:
+        transcript = transcript.replace(tag, replacement)
+    lines = transcript.split("\n")
+    transcript = "\n".join([" ".join(line.split()) for line in lines if line.strip()])
+    transcript = transcript.strip()
+
+    if not any([transcript.endswith(c) for c in [".", "!", "?", ",", ";", '"', "'", "</SE_e>", "</SE>"]]):
+        transcript += "."
+
+    messages, audio_ids = prepare_generation_context(
+        scene_prompt=scene_prompt,
+        ref_audio=ref_audio,
+        ref_audio_in_system_message=ref_audio_in_system_message,
+        audio_tokenizer=audio_tokenizer,
+        speaker_tags=speaker_tags,
+    )
+    chunked_text = prepare_chunk_text(
+        transcript,
+        chunk_method=chunk_method,
+        chunk_max_word_num=chunk_max_word_num,
+        chunk_max_num_turns=chunk_max_num_turns,
+    )
+
+    logger.info("Chunks used for generation:")
+    for idx, chunk_text in enumerate(chunked_text):
+        logger.info(f"Chunk {idx}:")
+        logger.info(chunk_text)
+        logger.info("-----")
+
+    concat_wv, sr, text_output = model_client.generate(
+        messages=messages,
+        audio_ids=audio_ids,
+        chunked_text=chunked_text,
+        generation_chunk_buffer_size=generation_chunk_buffer_size,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        ras_win_len=ras_win_len,
+        ras_win_max_num_repeat=ras_win_max_num_repeat,
+        seed=seed,
+    )
+
+    sf.write(out_path, concat_wv, sr)
+    logger.info(f"Wav file is saved to '{out_path}' with sample rate {sr}")
+
+
+if __name__ == "__main__":
+    main()

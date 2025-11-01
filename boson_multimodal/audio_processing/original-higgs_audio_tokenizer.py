@@ -61,8 +61,6 @@ class HiggsAudioTokenizer(nn.Module):
         vq_scale: int = 1,
         semantic_sample_rate: int = None,
         device: str = "cuda",
-        # NEW: path to local Hubert (e.g., /mnt/data3/VoiceModels/Higgs/bosonai-hubert_base)
-        hubert_path: Optional[str] = None,
     ):
         super().__init__()
         self.hop_length = np.prod(ratios)
@@ -78,33 +76,23 @@ class HiggsAudioTokenizer(nn.Module):
         self.decoder_2 = dac2.Decoder(D, 1024, ratios)
         self.last_layer_semantic = last_layer_semantic
         self.device = device
-
-        # -------------------- LOCAL-ONLY HUBERT LOADING --------------------
-        if self.semantic_techer in ("hubert_base", "hubert_base_general"):
-            # Resolve a local path for Hubert: prefer explicit arg, then env var
-            _hubert_path = hubert_path or os.getenv("HIGGS_HUBERT_PATH")
-            if not _hubert_path:
-                raise ValueError(
-                    "Hubert path not provided. Pass hubert_path=... or export HIGGS_HUBERT_PATH to a local directory."
-                )
-            # Local-only load; no network calls
-            self.semantic_model = AutoModel.from_pretrained(
-                _hubert_path,
-                trust_remote_code=True,
-                local_files_only=True,
-            )
+        if semantic_techer == "hubert_base":
+            self.semantic_model = AutoModel.from_pretrained("facebook/hubert-base-ls960")
             self.semantic_sample_rate = 16000
             self.semantic_dim = 768
             self.encoder_semantic_dim = 768
 
         elif semantic_techer == "wavlm_base_plus":
-            # If you need offline for this too, mirror the HF repo locally and pass via hubert_path;
-            # current default keeps the original behavior.
             self.semantic_model = AutoModel.from_pretrained("microsoft/wavlm-base-plus")
             self.semantic_sample_rate = 16000
             self.semantic_dim = 768
             self.encoder_semantic_dim = 768
-        # -------------------------------------------------------------------
+
+        elif semantic_techer == "hubert_base_general":
+            self.semantic_model = AutoModel.from_pretrained("bosonai/hubert_base", trust_remote_code=True)
+            self.semantic_sample_rate = 16000
+            self.semantic_dim = 768
+            self.encoder_semantic_dim = 768
 
         # Overwrite semantic model sr to ensure semantic_downsample_factor is an integer
         if semantic_sample_rate is not None:
@@ -321,33 +309,18 @@ class HiggsAudioTokenizer(nn.Module):
         return o.detach().cpu().numpy()
 
 
-def load_higgs_audio_tokenizer(tokenizer_name_or_path, device="cuda", hubert_path: Optional[str] = None, offline: bool = True):
-    """
-    Load the Higgs audio tokenizer.
-    - If `tokenizer_name_or_path` is a local directory, load from it.
-    - If it's a repo id:
-        * offline=True (default): raise an error (no network).
-        * offline=False: snapshot download to a local cache directory.
-    Always pass `hubert_path` through so the tokenizer loads Hubert locally.
-    """
+def load_higgs_audio_tokenizer(tokenizer_name_or_path, device="cuda"):
     is_local = os.path.exists(tokenizer_name_or_path)
     if not is_local:
-        if offline or os.getenv("HF_HUB_OFFLINE") == "1" or os.getenv("TRANSFORMERS_OFFLINE") == "1":
-            raise FileNotFoundError(
-                f"Tokenizer path '{tokenizer_name_or_path}' not found locally and offline is enabled. "
-                f"Please download it to a local folder or set offline=False for a one-time snapshot."
-            )
         tokenizer_path = snapshot_download(tokenizer_name_or_path)
     else:
         tokenizer_path = tokenizer_name_or_path
-
     config_path = os.path.join(tokenizer_path, "config.json")
     model_path = os.path.join(tokenizer_path, "model.pth")
     config = json.load(open(config_path))
     model = HiggsAudioTokenizer(
         **config,
         device=device,
-        hubert_path=hubert_path,  # ensure Hubert is loaded from a local directory
     )
     parameter_dict = torch.load(model_path, map_location=device)
     model.load_state_dict(parameter_dict, strict=False)
